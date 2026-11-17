@@ -140,7 +140,7 @@ jobs:
                                   success += 1
                               elif any(a.get("status") in REJECT_STATUSES for a in activities):
                                   rejected += 1
-                              elif not any(str(a.get("status") or "").strip() for a in activities):
+                              else:
                                   not_responded += 1
 
                           token = data.get("nextPageToken")
