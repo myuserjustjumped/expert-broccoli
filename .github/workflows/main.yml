@@ -1,0 +1,208 @@
+name: Check Roblox Reports
+
+on:
+  workflow_dispatch:
+    inputs:
+      page_size:
+        description: "Max page size per request"
+        required: false
+        default: 100
+        type: number
+      timeout:
+        description: "Request timeout in seconds"
+        required: false
+        default: 30
+        type: number
+
+permissions:
+  contents: read
+
+jobs:
+  check-reports:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: python -m pip install --quiet requests
+
+      - name: Check reports
+        env:
+          COOKIES: ${{ secrets.COOKIES }}
+          PAGE_SIZE: ${{ inputs.page_size }}
+          TIMEOUT: ${{ inputs.timeout }}
+        run: |
+          python -u - << 'EOF'
+          import os
+          import random
+          import sys
+          import time
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          import requests
+
+          URL = "https://usermoderation.roblox.com/v1/reports"
+          SUCCESS_STATUSES = {"violation"}
+          REJECT_STATUSES = {"no_violation"}
+
+          MAX_RETRIES = 6
+
+          HEADERS = {
+              "Accept": "application/json, text/plain, */*",
+              "Accept-Language": "en",
+              "Origin": "https://www.roblox.com",
+              "Referer": "https://www.roblox.com/",
+              "User-Agent": (
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+              ),
+          }
+
+
+          def get_positive_int_env(name, default):
+              raw = os.environ.get(name, "").strip()
+              if not raw:
+                  return default
+              value = int(raw)
+              if value <= 0:
+                  raise ValueError(f"{name} must be greater than 0, got {value}")
+              return value
+
+
+          PAGE_SIZE = get_positive_int_env("PAGE_SIZE", 100)
+          TIMEOUT = get_positive_int_env("TIMEOUT", 30)
+
+
+          def load_cookies():
+              raw_cookies = os.environ.get("COOKIES", "")
+              cookies = []
+              for line in raw_cookies.splitlines():
+                  line = line.strip()
+                  if not line:
+                      continue
+                  if ".ROBLOSECURITY" not in line:
+                      line = f".ROBLOSECURITY={line}"
+                  cookies.append(line)
+              return cookies
+
+
+          def get_page(session, params):
+              """GET one page, retrying on 429/5xx and network errors with backoff."""
+              last_error = None
+              for attempt in range(MAX_RETRIES):
+                  retry_after = None
+                  try:
+                      r = session.get(URL, params=params, timeout=TIMEOUT)
+                      if r.status_code == 200:
+                          return r.json()
+                      if r.status_code in (429, 500, 502, 503, 504):
+                          last_error = f"HTTP {r.status_code}: {r.text[:120]}"
+                          if r.status_code == 429:
+                              ra = r.headers.get("Retry-After", "").strip()
+                              if ra.isdigit():
+                                  retry_after = min(60, int(ra))
+                      else:
+                          raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+                  except requests.RequestException as e:
+                      last_error = str(e)
+
+                  delay = min(30, 2 ** attempt) + random.uniform(0, 1)
+                  if retry_after is not None:
+                      delay = max(delay, retry_after)
+                  time.sleep(delay)
+
+              raise RuntimeError(f"Gave up after {MAX_RETRIES} tries. Last error: {last_error}")
+
+
+          def process_cookie(index, cookie):
+              success = 0
+              rejected = 0
+              not_responded = 0
+              total = 0
+              token = None
+
+              try:
+                  with requests.Session() as session:
+                      session.headers.update({**HEADERS, "Cookie": cookie})
+                      while True:
+                          params = {"pageSize": PAGE_SIZE, "timeZone": "Asia/Manila"}
+                          if token:
+                              params["pageToken"] = token
+                          data = get_page(session, params)
+                          page_reports = data.get("reports") or []
+                          total += len(page_reports)
+
+                          for rep in page_reports:
+                              activities = (rep.get("details") or {}).get("activities") or []
+                              if any(a.get("status") in SUCCESS_STATUSES for a in activities):
+                                  success += 1
+                              elif any(a.get("status") in REJECT_STATUSES for a in activities):
+                                  rejected += 1
+                              elif not any(str(a.get("status") or "").strip() for a in activities):
+                                  not_responded += 1
+
+                          token = data.get("nextPageToken")
+                          if not token:
+                              break
+              except Exception as e:
+                  return index, [f"Failed: {e}"], 0, 0, 0, 0, False
+
+              lines = [
+                  f"Successful: {success}",
+                  f"Rejected: {rejected}",
+                  f"Not responded yet: {not_responded}",
+                  f"Total reports: {total}",
+              ]
+              return index, lines, success, rejected, not_responded, total, True
+
+
+          def main():
+              cookies = load_cookies()
+              if not cookies:
+                  print("COOKIES secret is empty or not set.")
+                  sys.exit(1)
+
+              workers = len(cookies)
+              print(
+                  f"{len(cookies)} cookie(s), {workers} worker(s), "
+                  f"pageSize={PAGE_SIZE}, timeout={TIMEOUT}s..."
+              )
+
+              total_success = 0
+              total_rejected = 0
+              total_not_responded = 0
+              total_reports = 0
+              failed = []
+
+              with ThreadPoolExecutor(max_workers=workers) as executor:
+                  futures = [
+                      executor.submit(process_cookie, i, c)
+                      for i, c in enumerate(cookies, 1)
+                  ]
+                  for future in as_completed(futures):
+                      index, lines, success, rejected, not_responded, total, ok = future.result()
+                      print(f"\n=== Cookie #{index} ===")
+                      print("\n".join(lines))
+                      if ok:
+                          total_success += success
+                          total_rejected += rejected
+                          total_not_responded += not_responded
+                          total_reports += total
+                      else:
+                          failed.append(index)
+
+              if len(cookies) > 1:
+                  print("\n=== All cookies ===")
+                  print(f"Successful: {total_success}")
+                  print(f"Rejected: {total_rejected}")
+                  print(f"Not responded yet: {total_not_responded}")
+                  print(f"Total reports: {total_reports}")
+                  if failed:
+                      print(f"Failed cookies: {sorted(failed)}")
+
+
+          if __name__ == "__main__":
+              main()
+          EOF
